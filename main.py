@@ -809,15 +809,17 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
         # AIマスク用の状態変数
         self.aimask_masks = None
         self.aimask_confidences = None
+        self.aimask_manual_masks = {}
+        self.aimask_manual_erase_masks = {}
         self.aimask_enabled_categories = {
             "Person": True,
             "Face": True,
             "Object": True,
             "Text": True,
             "Sky": True,
-            "Background": False,
-            "Manual": True
+            "Background": False
         }
+        self.aimask_manual_target_var = tk.StringVar(value="Text")
         self.aimask_manual_mode_var = tk.StringVar(value="pan")
         self.aimask_manual_brush_var = tk.IntVar(value=24)
         
@@ -1444,8 +1446,7 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
             "Object": "オブジェクト (Object)",
             "Text": "テキスト・文字 (Text)",
             "Sky": "空・天候 (Sky)",
-            "Background": "背景 (Background)",
-            "Manual": "手動マスク (Manual)"
+            "Background": "背景 (Background)"
         }
         
         for cat, label_ja in categories_ja.items():
@@ -1491,6 +1492,22 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
             text_color=COLOR_TEXT
         )
         self.manual_title_label.pack(anchor="w", pady=(5, 5))
+
+        self.manual_target_label = ctk.CTkLabel(
+            self.aimask_scroll,
+            text="編集対象レイヤー",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            text_color=COLOR_TEXT_MUTED
+        )
+        self.manual_target_label.pack(anchor="w", pady=(0, 4))
+
+        self.manual_target_combo = ctk.CTkOptionMenu(
+            self.aimask_scroll,
+            values=["Person", "Face", "Object", "Text", "Sky", "Background"],
+            variable=self.aimask_manual_target_var,
+            command=self.update_aimask_manual_target
+        )
+        self.manual_target_combo.pack(fill="x", pady=(0, 8))
 
         self.manual_mode_frame = ctk.CTkFrame(self.aimask_scroll, fg_color="transparent")
         self.manual_mode_frame.pack(fill="x", pady=(0, 8))
@@ -1545,7 +1562,7 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
 
         self.manual_clear_btn = ctk.CTkButton(
             self.aimask_scroll,
-            text="手動マスクをクリア",
+            text="選択レイヤーをクリア",
             fg_color="transparent",
             border_color=COLOR_BORDER,
             border_width=2,
@@ -1806,6 +1823,10 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
     def update_aimask_sens_label(self, val):
         self.sens_val_label.configure(text=f"{val:.2f}")
 
+    def update_aimask_manual_target(self, value):
+        self.aimask_manual_target_var.set(value)
+        self.update_aimask_preview()
+
     def update_aimask_manual_mode(self):
         mode = self.aimask_manual_mode_var.get()
         brush_size = self.aimask_manual_brush_var.get()
@@ -1817,57 +1838,94 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
         self.manual_brush_label.configure(text=f"ブラシサイズ: {brush_size}px")
         self.aimask_preview.set_manual_mode(self.aimask_manual_mode_var.get(), brush_size)
 
-    def ensure_aimask_manual_mask(self):
+    def ensure_aimask_edit_masks(self, cat=None):
         if self.input_image_pil is None:
-            return None
+            return None, None
+        cat = cat or self.aimask_manual_target_var.get()
         h = self.input_image_pil.height
         w = self.input_image_pil.width
-        if self.aimask_masks is None:
-            self.aimask_masks = {}
-            self.aimask_confidences = {}
-            for cat in self.mask_engine.category_colors.keys():
-                self.aimask_masks[cat] = np.zeros((h, w), dtype=np.uint8)
-                self.aimask_confidences[cat] = 0.0
-        if "Manual" not in self.aimask_masks:
-            self.aimask_masks["Manual"] = np.zeros((h, w), dtype=np.uint8)
-        if self.aimask_confidences is not None and "Manual" not in self.aimask_confidences:
-            self.aimask_confidences["Manual"] = 0.0
-        return self.aimask_masks["Manual"]
+        if self.aimask_manual_masks is None:
+            self.aimask_manual_masks = {}
+        if self.aimask_manual_erase_masks is None:
+            self.aimask_manual_erase_masks = {}
+        if cat not in self.aimask_manual_masks:
+            self.aimask_manual_masks[cat] = np.zeros((h, w), dtype=np.uint8)
+        if cat not in self.aimask_manual_erase_masks:
+            self.aimask_manual_erase_masks[cat] = np.zeros((h, w), dtype=np.uint8)
+        return self.aimask_manual_masks[cat], self.aimask_manual_erase_masks[cat]
+
+    def aimask_layer_has_manual_edit(self, cat):
+        add_mask = self.aimask_manual_masks.get(cat)
+        erase_mask = self.aimask_manual_erase_masks.get(cat)
+        has_add = add_mask is not None and np.any(add_mask > 0)
+        has_erase = erase_mask is not None and np.any(erase_mask > 0)
+        return has_add or has_erase
 
     def has_saveable_aimask(self):
-        if self.aimask_masks is None:
+        if self.aimask_masks is None and not self.aimask_manual_masks and not self.aimask_manual_erase_masks:
+            return False
+        merged = self.get_merged_aimask_masks()
+        if merged is None:
             return False
         for cat, is_enabled in self.aimask_enabled_categories.items():
-            if is_enabled and cat in self.aimask_masks and np.any(self.aimask_masks[cat] > 0):
+            if is_enabled and cat in merged and np.any(merged[cat] > 0):
                 return True
         return False
 
     def paint_aimask_manual_mask(self, x, y, brush_size, erase=False):
-        manual_mask = self.ensure_aimask_manual_mask()
-        if manual_mask is None:
+        target_cat = self.aimask_manual_target_var.get()
+        add_mask, erase_mask = self.ensure_aimask_edit_masks(target_cat)
+        if add_mask is None or erase_mask is None:
             return
-        color = 0 if erase else 255
-        cv2.circle(manual_mask, (x, y), max(1, brush_size // 2), color, -1)
-        if self.aimask_confidences is not None:
-            self.aimask_confidences["Manual"] = 1.0 if np.any(manual_mask > 0) else 0.0
-        lbl = self.aimask_layer_score_labels.get("Manual")
+        radius = max(1, brush_size // 2)
+        if erase:
+            cv2.circle(add_mask, (x, y), radius, 0, -1)
+            cv2.circle(erase_mask, (x, y), radius, 255, -1)
+        else:
+            cv2.circle(add_mask, (x, y), radius, 255, -1)
+            cv2.circle(erase_mask, (x, y), radius, 0, -1)
+        lbl = self.aimask_layer_score_labels.get(target_cat)
         if lbl:
-            lbl.configure(text="手動編集あり" if np.any(manual_mask > 0) else "未作成")
+            lbl.configure(text="手動編集あり" if self.aimask_layer_has_manual_edit(target_cat) else "未作成")
         self.aimask_save_btn.configure(state="normal" if self.has_saveable_aimask() else "disabled")
         self.update_aimask_preview()
 
     def clear_aimask_manual_mask(self):
-        manual_mask = self.ensure_aimask_manual_mask()
-        if manual_mask is None:
+        target_cat = self.aimask_manual_target_var.get()
+        add_mask, erase_mask = self.ensure_aimask_edit_masks(target_cat)
+        if add_mask is None or erase_mask is None:
             return
-        manual_mask[:, :] = 0
-        if self.aimask_confidences is not None:
-            self.aimask_confidences["Manual"] = 0.0
-        lbl = self.aimask_layer_score_labels.get("Manual")
+        add_mask[:, :] = 0
+        erase_mask[:, :] = 0
+        lbl = self.aimask_layer_score_labels.get(target_cat)
         if lbl:
-            lbl.configure(text="未作成")
+            score = self.aimask_confidences.get(target_cat, 0.0) if self.aimask_confidences else 0.0
+            lbl.configure(text=f"信頼度: {score:.2f}" if score > 0.0 else "未検出")
         self.aimask_save_btn.configure(state="normal" if self.has_saveable_aimask() else "disabled")
         self.update_aimask_preview()
+
+    def get_merged_aimask_masks(self):
+        if self.input_image_pil is None:
+            return None
+        h = self.input_image_pil.height
+        w = self.input_image_pil.width
+        merged = {}
+        for cat in self.aimask_enabled_categories.keys():
+            if self.aimask_masks is not None and cat in self.aimask_masks:
+                merged[cat] = self.aimask_masks[cat].copy()
+            else:
+                merged[cat] = np.zeros((h, w), dtype=np.uint8)
+
+        for cat, add_mask in self.aimask_manual_masks.items():
+            if cat not in merged:
+                merged[cat] = np.zeros((h, w), dtype=np.uint8)
+            merged[cat] = cv2.bitwise_or(merged[cat], add_mask)
+
+        for cat, erase_mask in self.aimask_manual_erase_masks.items():
+            if cat not in merged:
+                continue
+            merged[cat] = cv2.bitwise_and(merged[cat], cv2.bitwise_not(erase_mask))
+        return merged
 
     def on_aimask_layer_toggle(self, cat):
         if cat in self.aimask_layer_checkboxes:
@@ -1879,10 +1937,11 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
         if self.input_image_pil is None:
             return
         
-        if self.aimask_masks is not None:
+        merged_masks = self.get_merged_aimask_masks()
+        if merged_masks is not None:
             overlay_img = self.mask_engine.create_overlay(
                 np.array(self.input_image_pil),
-                self.aimask_masks,
+                merged_masks,
                 self.aimask_enabled_categories,
                 opacity=0.4
             )
@@ -1898,6 +1957,7 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
         self.aimask_run_btn.configure(state="disabled")
         self.aimask_save_btn.configure(state="disabled")
         self.aimask_sens_slider.configure(state="disabled")
+        self.manual_target_combo.configure(state="disabled")
         
         self.aimask_progressbar.pack(fill="x", pady=(0, 10), after=self.aimask_status_label)
         self.aimask_progressbar.configure(mode="determinate")
@@ -1934,26 +1994,32 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
         self.aimask_run_btn.configure(state="normal")
         self.aimask_save_btn.configure(state="normal")
         self.aimask_sens_slider.configure(state="normal")
+        self.manual_target_combo.configure(state="normal")
         
-        previous_manual_mask = None
-        if self.aimask_masks is not None and "Manual" in self.aimask_masks:
-            previous_manual_mask = self.aimask_masks["Manual"].copy()
+        previous_manual_masks = {}
+        for cat, mask in self.aimask_manual_masks.items():
+            previous_manual_masks[cat] = mask.copy()
+        previous_manual_erase_masks = {}
+        for cat, mask in self.aimask_manual_erase_masks.items():
+            previous_manual_erase_masks[cat] = mask.copy()
 
         self.aimask_masks = masks
         self.aimask_confidences = confidences
-        if previous_manual_mask is not None and np.any(previous_manual_mask > 0):
-            self.aimask_masks["Manual"] = previous_manual_mask
-            self.aimask_confidences["Manual"] = 1.0
-        elif "Manual" not in self.aimask_masks and self.input_image_pil is not None:
-            self.aimask_masks["Manual"] = np.zeros((self.input_image_pil.height, self.input_image_pil.width), dtype=np.uint8)
-            self.aimask_confidences["Manual"] = 0.0
+        self.aimask_manual_masks = previous_manual_masks
+        self.aimask_manual_erase_masks = previous_manual_erase_masks
+        if self.input_image_pil is not None:
+            for cat in self.aimask_enabled_categories.keys():
+                if cat not in self.aimask_manual_masks:
+                    self.aimask_manual_masks[cat] = np.zeros((self.input_image_pil.height, self.input_image_pil.width), dtype=np.uint8)
+                if cat not in self.aimask_manual_erase_masks:
+                    self.aimask_manual_erase_masks[cat] = np.zeros((self.input_image_pil.height, self.input_image_pil.width), dtype=np.uint8)
         
         # 信頼度スコアをラベルに反映
         for cat, score in confidences.items():
             lbl = self.aimask_layer_score_labels.get(cat)
             if lbl:
-                if cat == "Manual":
-                    lbl.configure(text="手動編集あり" if score > 0.0 else "未作成")
+                if self.aimask_layer_has_manual_edit(cat):
+                    lbl.configure(text="手動編集あり")
                 elif score > 0.0:
                     lbl.configure(text=f"信頼度: {score:.2f}")
                 else:
@@ -1971,12 +2037,16 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
         self.aimask_run_btn.configure(state="normal")
         self.aimask_save_btn.configure(state="disabled")
         self.aimask_sens_slider.configure(state="normal")
+        self.manual_target_combo.configure(state="normal")
         
         self.aimask_status_label.configure(text="解析中にエラーが発生しました。", text_color="#EF4444")
         messagebox.showerror("解析エラー", f"AIマスク解析中にエラーが発生しました:\n{err_msg}")
 
     def save_aimasks(self):
-        if self.aimask_masks is None or self.input_file_path is None:
+        if self.input_file_path is None:
+            return
+        merged_masks = self.get_merged_aimask_masks()
+        if merged_masks is None:
             return
             
         base, _ = os.path.splitext(os.path.basename(self.input_file_path))
@@ -1991,8 +2061,8 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
             try:
                 saved_count = 0
                 for cat, is_enabled in self.aimask_enabled_categories.items():
-                    if is_enabled and cat in self.aimask_masks:
-                        mask = self.aimask_masks[cat]
+                    if is_enabled and merged_masks and cat in merged_masks:
+                        mask = merged_masks[cat]
                         if np.any(mask > 0):
                             save_path = os.path.join(selected_dir, f"{base}_{cat.lower()}_mask.png")
                             # 日本語パスでも安全に保存するために OpenCV を利用
@@ -2174,8 +2244,12 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
             self.aimask_save_btn.configure(state="disabled")
             self.aimask_masks = None
             self.aimask_confidences = None
+            self.aimask_manual_masks = {}
+            self.aimask_manual_erase_masks = {}
             for cat in self.aimask_layer_score_labels:
                 self.aimask_layer_score_labels[cat].configure(text="-")
+            self.manual_target_combo.set("Text")
+            self.aimask_manual_target_var.set("Text")
             self.aimask_status_label.configure(
                 text="解析ボタンを押すとAIセグメンテーションを開始します",
                 text_color=COLOR_TEXT
@@ -2492,6 +2566,8 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
         self.aimask_save_btn.configure(state="disabled")
         self.aimask_masks = None
         self.aimask_confidences = None
+        self.aimask_manual_masks = {}
+        self.aimask_manual_erase_masks = {}
         for cat in self.aimask_layer_score_labels:
             self.aimask_layer_score_labels[cat].configure(text="-")
         self.aimask_status_label.configure(

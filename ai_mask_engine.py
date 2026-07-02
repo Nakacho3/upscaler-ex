@@ -23,8 +23,7 @@ class AIMaskEngine:
             "Object": (168, 85, 247),     # 紫
             "Text": (249, 115, 22),       # オレンジ
             "Sky": (14, 165, 233),        # 水色
-            "Background": (100, 116, 139), # グレー
-            "Manual": (250, 204, 21)      # 黄
+            "Background": (100, 116, 139) # グレー
         }
 
     def generate_masks(self, img_rgb, confidence_threshold=0.5, progress_callback=None):
@@ -147,72 +146,11 @@ class AIMaskEngine:
         confidences["Face"] = face_score
 
         if progress_callback:
-            progress_callback("テキスト領域をスキャン中...", 0.6)
+            progress_callback("テキスト領域は手動編集を推奨しています...", 0.6)
 
-        # 3. テキスト (Text) の抽出 (MSER候補を文字列らしい横並びに絞り込む)
+        # 3. テキスト (Text) は自動検出しない
         text_mask = np.zeros((h, w), dtype=np.uint8)
         text_score = 0.0
-        try:
-            gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-            mser = cv2.MSER_create(
-                min_area=max(8, int(h * w * 0.000015)),
-                max_area=max(80, int(h * w * 0.008)),
-                max_variation=0.45
-            )
-            regions, _ = mser.detectRegions(gray)
-            candidate_boxes = []
-            candidate_mask = np.zeros((h, w), dtype=np.uint8)
-            for p in regions:
-                x, y, bw, bh = cv2.boundingRect(p)
-                if bw <= 0 or bh <= 0:
-                    continue
-                area = bw * bh
-                aspect = bw / float(bh)
-                fill_ratio = len(p) / float(area)
-                if not (6 <= bw <= w * 0.22 and 6 <= bh <= h * 0.12):
-                    continue
-                if not (0.15 <= aspect <= 8.0 and 0.12 <= fill_ratio <= 0.88):
-                    continue
-                candidate_boxes.append((x, y, bw, bh))
-                cv2.rectangle(candidate_mask, (x, y), (x + bw, y + bh), 255, -1)
-
-            if candidate_boxes:
-                kernel_w = max(9, int(w * 0.018))
-                kernel_h = max(3, int(h * 0.006))
-                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, kernel_h))
-                grouped = cv2.morphologyEx(candidate_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-                contours, _ = cv2.findContours(grouped, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-                for cnt in contours:
-                    x, y, bw, bh = cv2.boundingRect(cnt)
-                    if bw <= 0 or bh <= 0:
-                        continue
-                    group_area = bw * bh
-                    group_aspect = bw / float(bh)
-                    if group_area > h * w * 0.08 or group_aspect < 1.2:
-                        continue
-
-                    members = [
-                        box for box in candidate_boxes
-                        if box[0] >= x and box[1] >= y and box[0] + box[2] <= x + bw and box[1] + box[3] <= y + bh
-                    ]
-                    if len(members) < 2 and bw < 24:
-                        continue
-
-                    pad_x = max(2, int(bh * 0.25))
-                    pad_y = max(1, int(bh * 0.15))
-                    x0 = max(0, x - pad_x)
-                    y0 = max(0, y - pad_y)
-                    x1 = min(w, x + bw + pad_x)
-                    y1 = min(h, y + bh + pad_y)
-                    cv2.rectangle(text_mask, (x0, y0), (x1, y1), 255, -1)
-            
-            # テキストらしい領域があれば、ダミーの適度な信頼度をセット
-            if np.any(text_mask > 0):
-                text_score = 0.75
-        except Exception as e:
-            print(f"Text detection error: {e}")
-
         masks["Text"] = text_mask
         confidences["Text"] = text_score
 

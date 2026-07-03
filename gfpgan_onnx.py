@@ -33,6 +33,43 @@ class GFPGANOnnxRunner:
             "url": "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_full_range/float16/latest/blaze_face_full_range.tflite"
         }
 
+    def _blend_restored_face(self, face_input, face_output_raw, fidelity):
+        f_val = max(0.0, min(1.0, float(fidelity)))
+        if f_val <= 0.0:
+            return face_input.copy()
+
+        eye_mask = np.zeros((512, 512), dtype=np.float32)
+        cv2.ellipse(eye_mask, (192, 240), (58, 34), 0, 0, 360, 1.0, -1)
+        cv2.ellipse(eye_mask, (320, 240), (58, 34), 0, 0, 360, 1.0, -1)
+        eye_mask = cv2.GaussianBlur(eye_mask, (41, 41), 0)
+        eye_mask = np.expand_dims(eye_mask, axis=2)
+
+        # GFPGANは目元を作り替えやすいため、目だけはスライダー値より強く元画像を残す。
+        face_strength = min(0.85, f_val * 0.85)
+        eye_strength = min(0.18, f_val * 0.18)
+        blend_map = eye_mask * eye_strength + (1.0 - eye_mask) * face_strength
+
+        blended = (
+            face_output_raw.astype(np.float32) * blend_map +
+            face_input.astype(np.float32) * (1.0 - blend_map)
+        )
+        return np.clip(blended, 0, 255).astype(np.uint8)
+
+    def _create_face_paste_mask(self, M_inv, width, height, fidelity):
+        f_val = max(0.0, min(1.0, float(fidelity)))
+        if f_val <= 0.0:
+            return np.zeros((height, width, 1), dtype=np.float32)
+
+        mask_512 = np.zeros((512, 512), dtype=np.float32)
+        cv2.ellipse(mask_512, (256, 260), (170, 198), 0, 0, 360, 1.0, -1)
+        mask_512 = cv2.GaussianBlur(mask_512, (71, 71), 0)
+
+        paste_strength = min(0.92, max(0.08, f_val))
+        mask_512 *= paste_strength
+
+        mask_orig = cv2.warpAffine(mask_512, M_inv, (width, height), flags=cv2.INTER_LINEAR)
+        return np.expand_dims(mask_orig, axis=2)
+
     def check_and_download_model(self, progress_callback=None):
         """モデルが存在しない場合に自動ダウンロードする (複数のミラーURLを試行)"""
         if os.path.exists(self.model_path):
@@ -350,40 +387,13 @@ class GFPGANOnnxRunner:
                     "face_output_raw": face_output.copy()
                 })
 
-                # 元の顔画像(face_input)とGFPGANの復元画像をブレンドして、メイクやまつ毛、涙袋の質感を残す
-                if fidelity < 1.0:
-                    f_val = max(0.0, min(1.0, float(fidelity)))
-                    
-                    # 目の位置(左目: 192, 240, 右目: 320, 240)のマスクを作成し、目元がダブってボケるのを防止
-                    eye_mask = np.zeros((512, 512), dtype=np.float32)
-                    cv2.ellipse(eye_mask, (192, 240), (50, 30), 0, 0, 360, 1.0, -1) # 左目
-                    cv2.ellipse(eye_mask, (320, 240), (50, 30), 0, 0, 360, 1.0, -1) # 右目
-                    eye_mask = cv2.GaussianBlur(eye_mask, (35, 35), 0)
-                    eye_mask = np.expand_dims(eye_mask, axis=2) # (512, 512, 1)
-                    
-                    # 目元は元の質感を強く残すようにf_valを低減（スライダー設定値の30%まで抑える）
-                    # 肌など目の外側はスライダー値通りにツルツルに修復
-                    blend_map = eye_mask * (f_val * 0.3) + (1.0 - eye_mask) * f_val
-                    
-                    # 局所的なブレンド処理の適用
-                    face_output = (face_output.astype(np.float32) * blend_map + 
-                                   face_input.astype(np.float32) * (1.0 - blend_map))
-                    face_output = np.clip(face_output, 0, 255).astype(np.uint8)
+                face_output = self._blend_restored_face(face_input, face_output, fidelity)
 
                 # 逆アフィン変換で元の傾き・スケール・位置に正確に戻す
                 M_inv = cv2.invertAffineTransform(M)
                 restored_face = cv2.warpAffine(face_output, M_inv, (w_orig, h_orig), flags=cv2.INTER_LANCZOS4)
 
-                # 滑らかに貼り戻すためのアライメント用マスク作成
-                mask_512 = np.zeros((512, 512), dtype=np.float32)
-                # 目の配置(縦横比)に合わせた卵型のマスクを記述
-                cv2.ellipse(mask_512, (256, 256), (180, 210), 0, 0, 360, 1.0, -1)
-                # 境界を自然にぼかす
-                mask_512 = cv2.GaussianBlur(mask_512, (51, 51), 0)
-
-                # マスクも元の座標系へ逆アフィン変換
-                mask_orig = cv2.warpAffine(mask_512, M_inv, (w_orig, h_orig), flags=cv2.INTER_LINEAR)
-                mask_orig = np.expand_dims(mask_orig, axis=2)
+                mask_orig = self._create_face_paste_mask(M_inv, w_orig, h_orig, fidelity)
 
                 # 元の画像にマスクブレンド合成
                 out_img = (restored_face.astype(np.float32) * mask_orig + 
@@ -412,40 +422,13 @@ class GFPGANOnnxRunner:
                 face_input = face["face_input"]
                 face_output_raw = face["face_output_raw"]
 
-                # fidelity < 1.0 の場合のみブレンド処理を適用する (1.0 の場合は完全にAI復元顔を使用)
-                if fidelity < 1.0:
-                    f_val = max(0.0, min(1.0, float(fidelity)))
-                    
-                    # 目の位置(左目: 192, 240, 右目: 320, 240)のマスクを作成し、目元がダブってボケるのを防止
-                    eye_mask = np.zeros((512, 512), dtype=np.float32)
-                    cv2.ellipse(eye_mask, (192, 240), (50, 30), 0, 0, 360, 1.0, -1) # 左目
-                    cv2.ellipse(eye_mask, (320, 240), (50, 30), 0, 0, 360, 1.0, -1) # 右目
-                    eye_mask = cv2.GaussianBlur(eye_mask, (35, 35), 0)
-                    eye_mask = np.expand_dims(eye_mask, axis=2) # (512, 512, 1)
-                    
-                    # 目元は元の質感を強く残すようにf_valを低減（スライダー設定値の30%まで抑える）
-                    # 肌など目の外側はスライダー値通りにツルツルに修復
-                    blend_map = eye_mask * (f_val * 0.3) + (1.0 - eye_mask) * f_val
-                    
-                    # 局所的なブレンド処理の適用
-                    face_output = (face_output_raw.astype(np.float32) * blend_map + 
-                                   face_input.astype(np.float32) * (1.0 - blend_map))
-                    face_output = np.clip(face_output, 0, 255).astype(np.uint8)
-                else:
-                    face_output = face_output_raw.copy()
+                face_output = self._blend_restored_face(face_input, face_output_raw, fidelity)
 
                 # 逆アフィン変換で元の傾き・スケール・位置に正確に戻す
                 M_inv = cv2.invertAffineTransform(M)
                 restored_face = cv2.warpAffine(face_output, M_inv, (w_orig, h_orig), flags=cv2.INTER_LANCZOS4)
 
-                # 滑らかに貼り戻すためのアライメント用マスク作成
-                mask_512 = np.zeros((512, 512), dtype=np.float32)
-                cv2.ellipse(mask_512, (256, 256), (180, 210), 0, 0, 360, 1.0, -1)
-                mask_512 = cv2.GaussianBlur(mask_512, (51, 51), 0)
-
-                # マスクも元の座標系へ逆アフィン変換
-                mask_orig = cv2.warpAffine(mask_512, M_inv, (w_orig, h_orig), flags=cv2.INTER_LINEAR)
-                mask_orig = np.expand_dims(mask_orig, axis=2)
+                mask_orig = self._create_face_paste_mask(M_inv, w_orig, h_orig, fidelity)
 
                 # 元の画像にマスクブレンド合成
                 out_img = (restored_face.astype(np.float32) * mask_orig + 

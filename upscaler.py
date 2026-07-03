@@ -364,7 +364,30 @@ class ImageUpscalerEngine:
     # ==========================================
     # 4. アップスケーリングメイン処理
     # ==========================================
-    def process_image(self, input_image_path, scale=4, denoise_strength=10, sharpness_strength=30, face_restoration=False, face_restoration_fidelity=0.7, is_creature=False, progress_callback=None):
+    def _build_region_mask_low(self, region_masks, width, height):
+        if not region_masks:
+            return None
+
+        combined = np.zeros((height, width), dtype=np.uint8)
+        for mask in region_masks.values():
+            if mask is None:
+                continue
+            mask_np = np.asarray(mask)
+            if mask_np.ndim == 3:
+                mask_np = mask_np[:, :, 0]
+            if mask_np.shape[:2] != (height, width):
+                mask_np = cv2.resize(mask_np.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST)
+            combined = cv2.bitwise_or(combined, (mask_np > 0).astype(np.uint8) * 255)
+
+        if not np.any(combined > 0):
+            return None
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
+        return (combined > 0).astype(np.float32)
+
+    def process_image(self, input_image_path, scale=4, denoise_strength=10, sharpness_strength=30, face_restoration=False, face_restoration_fidelity=0.7, is_creature=False, region_masks=None, progress_callback=None):
         """画像処理の全体フローを実行する"""
         if progress_callback:
             progress_callback("画像を読み込んでいます...", 0.05)
@@ -381,9 +404,14 @@ class ImageUpscalerEngine:
         img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
         h, w, c = img_cv.shape
 
-        # 0. 生物（人物・動物）が選択されている場合、背景分離マスクを作成
+        # 0. AIマスクタブの編集済みマスクを優先し、なければ従来の背景分離マスクを作成
         mask_low = None
-        if is_creature and MEDIAPIPE_AVAILABLE:
+        if region_masks:
+            if progress_callback:
+                progress_callback("編集済みマスクをアップスケール処理へ適用中...", 0.15)
+            mask_low = self._build_region_mask_low(region_masks, w, h)
+
+        if mask_low is None and is_creature and MEDIAPIPE_AVAILABLE:
             try:
                 if progress_callback:
                     progress_callback("被写体（人物・動物）の領域を解析中...", 0.15)
@@ -437,11 +465,11 @@ class ImageUpscalerEngine:
 
         # 中間ベース画像と領域マスクを再合成用にキャッシュ
         self.cache_upscaled_base = upscaled_img.copy()
-        self.cache_is_creature = is_creature
+        self.cache_is_creature = mask_low is not None
         self.cache_mask_low = mask_low
 
         # 3.5 顔復元 (GFPGAN ONNX) の実行
-        if face_restoration:
+        if face_restoration and face_restoration_fidelity > 0.0:
             try:
                 if self.face_runner is None:
                     from gfpgan_onnx import GFPGANOnnxRunner
@@ -464,7 +492,7 @@ class ImageUpscalerEngine:
                 progress_callback("シャープネス（輪郭強調）を適用中...", 0.9)
             
             # 生物タイプかつマスクが正しく生成されている場合、背景部分のシャープネスを低減する
-            if is_creature and mask_low is not None:
+            if mask_low is not None:
                 try:
                     h_out, w_out, _ = upscaled_img.shape
                     # マスクを拡大サイズにリサイズ
@@ -649,7 +677,7 @@ class ImageUpscalerEngine:
         out_img = self.cache_upscaled_base.copy()
         
         # 1. 顔復元の再合成 (顔検出・推論なし)
-        if face_restoration and self.face_runner is not None:
+        if face_restoration and face_restoration_fidelity > 0.0 and self.face_runner is not None:
             out_img = self.face_runner.recomposite_faces(out_img, fidelity=face_restoration_fidelity)
             
         # 2. シャープネスの再適用 (推論なし)
@@ -672,4 +700,3 @@ class ImageUpscalerEngine:
                 out_img = self.apply_sharpness(out_img, sharpness_strength)
                 
         return Image.fromarray(out_img)
-

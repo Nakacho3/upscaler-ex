@@ -1084,7 +1084,7 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
 
         self.face_restore_label = ctk.CTkLabel(
             self.face_restore_slider_frame,
-            text="　修復強度: 70%",
+            text="　修復強度: 45%",
             font=ctk.CTkFont(family="Segoe UI", size=12),
             text_color=COLOR_TEXT_MUTED
         )
@@ -1092,15 +1092,15 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
 
         self.face_restore_slider = ctk.CTkSlider(
             self.face_restore_slider_frame,
-            from_=10,
+            from_=0,
             to=100,
-            number_of_steps=18,  # 5%刻み (10から100まで)
+            number_of_steps=20,  # 5%刻み
             button_color=COLOR_ACCENT,
             button_hover_color=COLOR_ACCENT_HOVER,
             progress_color=COLOR_ACCENT,
             command=self.update_face_restore_label
         )
-        self.face_restore_slider.set(70)
+        self.face_restore_slider.set(45)
         self.face_restore_slider.pack(fill="x")
 
         # --- 保存先設定 ---
@@ -1200,6 +1200,15 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
             wraplength=280
         )
         self.status_label.pack(fill="x", pady=(0, 15))
+
+        self.upscale_mask_label = ctk.CTkLabel(
+            self.action_frame,
+            text="AIマスク: 未使用",
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+            text_color=COLOR_TEXT_MUTED,
+            wraplength=280
+        )
+        self.upscale_mask_label.pack(fill="x", pady=(0, 10))
         
         # プログレスバー（デタミネイト型に変更）
         self.progressbar = ctk.CTkProgressBar(
@@ -1611,7 +1620,7 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
         )
         self.aimask_run_btn.pack(fill="x", pady=(0, 10))
 
-        # マスク保存ボタン
+        # 内部処理用。マスク保存UIは使わず、生成マスクはアップスケール処理へ渡す。
         self.aimask_save_btn = ctk.CTkButton(
             self.aimask_action_frame,
             text="💾 解析結果(マスク)を保存",
@@ -1626,7 +1635,6 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
             command=self.save_aimasks,
             state="disabled"
         )
-        self.aimask_save_btn.pack(fill="x")
 
         # 3.3 右側: AIマスクプレビューエリア
         self.aimask_main_view = ctk.CTkFrame(
@@ -1889,6 +1897,7 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
             lbl.configure(text="手動編集あり" if self.aimask_layer_has_manual_edit(target_cat) else "未作成")
         self.aimask_save_btn.configure(state="normal" if self.has_saveable_aimask() else "disabled")
         self.update_aimask_preview()
+        self.update_upscale_mask_label()
 
     def clear_aimask_manual_mask(self):
         target_cat = self.aimask_manual_target_var.get()
@@ -1903,6 +1912,7 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
             lbl.configure(text=f"信頼度: {score:.2f}" if score > 0.0 else "未検出")
         self.aimask_save_btn.configure(state="normal" if self.has_saveable_aimask() else "disabled")
         self.update_aimask_preview()
+        self.update_upscale_mask_label()
 
     def get_merged_aimask_masks(self):
         if self.input_image_pil is None:
@@ -1927,11 +1937,45 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
             merged[cat] = cv2.bitwise_and(merged[cat], cv2.bitwise_not(erase_mask))
         return merged
 
+    def get_upscale_region_masks(self):
+        merged_masks = self.get_merged_aimask_masks()
+        if merged_masks is None:
+            return None
+        upscale_categories = ("Person", "Face", "Object", "Text")
+        selected_masks = {}
+        for cat in upscale_categories:
+            if not self.aimask_enabled_categories.get(cat, False):
+                continue
+            mask = merged_masks.get(cat)
+            if mask is not None and np.any(mask > 0):
+                selected_masks[cat] = mask.copy()
+        return selected_masks if selected_masks else None
+
+    def update_upscale_mask_label(self):
+        if not hasattr(self, "upscale_mask_label"):
+            return
+        region_masks = self.get_upscale_region_masks()
+        if not region_masks:
+            self.upscale_mask_label.configure(text="AIマスク: 未使用", text_color=COLOR_TEXT_MUTED)
+            return
+        labels = {
+            "Person": "人物",
+            "Face": "顔",
+            "Object": "オブジェクト",
+            "Text": "テキスト"
+        }
+        active_names = [labels.get(cat, cat) for cat in region_masks.keys()]
+        self.upscale_mask_label.configure(
+            text=f"AIマスク: {', '.join(active_names)} を反映",
+            text_color=COLOR_ACCENT
+        )
+
     def on_aimask_layer_toggle(self, cat):
         if cat in self.aimask_layer_checkboxes:
             _, var = self.aimask_layer_checkboxes[cat]
             self.aimask_enabled_categories[cat] = var.get()
             self.update_aimask_preview()
+            self.update_upscale_mask_label()
 
     def update_aimask_preview(self):
         if self.input_image_pil is None:
@@ -2030,6 +2074,7 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
             text_color=COLOR_ACCENT
         )
         self.update_aimask_preview()
+        self.update_upscale_mask_label()
 
     def on_aimask_process_error(self, err_msg):
         self.processing = False
@@ -2254,6 +2299,7 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
                 text="解析ボタンを押すとAIセグメンテーションを開始します",
                 text_color=COLOR_TEXT
             )
+            self.update_upscale_mask_label()
             
         except Exception as e:
             messagebox.showerror("エラー", f"画像の読み込みに失敗しました: {str(e)}")
@@ -2434,6 +2480,10 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
         denoise = int(self.denoise_slider.get())
         sharpness = int(self.sharp_slider.get())
         face_fidelity = float(self.face_restore_slider.get()) / 100.0 if hasattr(self, 'face_restore_slider') else 0.7
+        region_masks = self.get_upscale_region_masks()
+        self.update_upscale_mask_label()
+        if region_masks:
+            self.status_label.configure(text="AIマスクを反映して高画質化します...", text_color=COLOR_ACCENT)
         
         def task():
             try:
@@ -2452,6 +2502,7 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
                     face_restoration=self.face_restore_var.get(),
                     face_restoration_fidelity=face_fidelity,
                     is_creature=is_creature,
+                    region_masks=region_masks,
                     progress_callback=progress_cb
                 )
                 
@@ -2574,6 +2625,7 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
             text="画像をロードすると解析を開始できます",
             text_color=COLOR_TEXT_MUTED
         )
+        self.update_upscale_mask_label()
 
 
 # ==========================================

@@ -39,14 +39,15 @@ class GFPGANOnnxRunner:
             return face_input.copy()
 
         eye_mask = np.zeros((512, 512), dtype=np.float32)
-        cv2.ellipse(eye_mask, (192, 240), (58, 34), 0, 0, 360, 1.0, -1)
-        cv2.ellipse(eye_mask, (320, 240), (58, 34), 0, 0, 360, 1.0, -1)
-        eye_mask = cv2.GaussianBlur(eye_mask, (41, 41), 0)
+        cv2.ellipse(eye_mask, (192, 238), (76, 44), 0, 0, 360, 1.0, -1)
+        cv2.ellipse(eye_mask, (320, 238), (76, 44), 0, 0, 360, 1.0, -1)
+        eye_mask = cv2.GaussianBlur(eye_mask, (55, 55), 0)
         eye_mask = np.expand_dims(eye_mask, axis=2)
 
         # GFPGANは目元を作り替えやすいため、目だけはスライダー値より強く元画像を残す。
-        face_strength = min(0.85, f_val * 0.85)
-        eye_strength = min(0.18, f_val * 0.18)
+        curve = f_val ** 1.5
+        face_strength = min(0.82, curve * 0.82)
+        eye_strength = min(0.035, curve * 0.035)
         blend_map = eye_mask * eye_strength + (1.0 - eye_mask) * face_strength
 
         blended = (
@@ -64,8 +65,15 @@ class GFPGANOnnxRunner:
         cv2.ellipse(mask_512, (256, 260), (170, 198), 0, 0, 360, 1.0, -1)
         mask_512 = cv2.GaussianBlur(mask_512, (71, 71), 0)
 
-        paste_strength = min(0.92, max(0.08, f_val))
+        eye_guard = np.zeros((512, 512), dtype=np.float32)
+        cv2.ellipse(eye_guard, (192, 238), (82, 50), 0, 0, 360, 1.0, -1)
+        cv2.ellipse(eye_guard, (320, 238), (82, 50), 0, 0, 360, 1.0, -1)
+        eye_guard = cv2.GaussianBlur(eye_guard, (59, 59), 0)
+
+        curve = f_val ** 1.5
+        paste_strength = min(0.88, curve * 0.88)
         mask_512 *= paste_strength
+        mask_512 *= (1.0 - eye_guard * 0.95)
 
         mask_orig = cv2.warpAffine(mask_512, M_inv, (width, height), flags=cv2.INTER_LINEAR)
         return np.expand_dims(mask_orig, axis=2)

@@ -11,6 +11,7 @@ import numpy as np
 # 自作エンジンのインポート
 from upscaler import ImageUpscalerEngine, CUPY_AVAILABLE, TENSORRT_AVAILABLE
 from ai_mask_engine import AIMaskEngine
+from scan_photo_processor import ScanPhotoProcessor, ScanProcessOptions
 
 # tkinterdnd2 を使用した安全なドラッグ＆ドロップのサポート
 try:
@@ -822,6 +823,11 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
         self.aimask_manual_target_var = tk.StringVar(value="Text")
         self.aimask_manual_mode_var = tk.StringVar(value="pan")
         self.aimask_manual_brush_var = tk.IntVar(value=24)
+        self.scan_file_paths = []
+        self.scan_output_dir_var = tk.StringVar(value="")
+        self.scan_degrid_strength_var = tk.IntVar(value=55)
+        self.scan_detail_keep_var = tk.IntVar(value=30)
+        self.scan_moire_var = tk.BooleanVar(value=True)
         
         # プリセット適正値の定義
         self.presets = {
@@ -834,6 +840,7 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
         # 画像処理エンジンの初期化
         self.engine = ImageUpscalerEngine()
         self.mask_engine = AIMaskEngine()
+        self.scan_processor = ScanPhotoProcessor()
         
         # GUIスレッド通信用のセーフキュー
         self.gui_queue = queue.Queue()
@@ -865,6 +872,7 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
         
         self.tab_upscale = self.tabview.add("アップスケール")
         self.tab_aimask = self.tabview.add("AIマスク生成")
+        self.tab_scan = self.tabview.add("印刷スキャン除去")
         
         # --- アップスケールタブのグリッド構成 ---
         self.tab_upscale.grid_columnconfigure(0, weight=0, minsize=320)  # コントロールパネル
@@ -1672,6 +1680,411 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
         )
         self.aimask_placeholder_text.pack(expand=True, pady=(10, 80))
 
+        self.build_scan_tab()
+
+    def build_scan_tab(self):
+        self.tab_scan.grid_columnconfigure(0, weight=0, minsize=340)
+        self.tab_scan.grid_columnconfigure(1, weight=1)
+        self.tab_scan.grid_rowconfigure(0, weight=1)
+
+        self.scan_side_panel = ctk.CTkFrame(
+            self.tab_scan,
+            fg_color=COLOR_PANEL_DARK,
+            border_color=COLOR_BORDER,
+            border_width=1,
+            corner_radius=0
+        )
+        self.scan_side_panel.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+
+        self.scan_title = ctk.CTkLabel(
+            self.scan_side_panel,
+            text="PRINT SCAN CLEANER",
+            font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"),
+            text_color=COLOR_ACCENT
+        )
+        self.scan_title.pack(pady=(20, 5), padx=20, anchor="w")
+
+        self.scan_subtitle = ctk.CTkLabel(
+            self.scan_side_panel,
+            text="写真集・グラビアの網点、モアレ、スキャンノイズを低減",
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+            text_color=COLOR_TEXT_MUTED,
+            wraplength=290
+        )
+        self.scan_subtitle.pack(pady=(0, 15), padx=20, anchor="w")
+
+        self.create_separator(self.scan_side_panel)
+
+        self.scan_scroll = ctk.CTkScrollableFrame(self.scan_side_panel, fg_color="transparent")
+        self.scan_scroll.pack(fill="both", expand=True, padx=15, pady=5)
+
+        self.scan_files_label = ctk.CTkLabel(
+            self.scan_scroll,
+            text="処理する画像 (最大100枚)",
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            text_color=COLOR_TEXT
+        )
+        self.scan_files_label.pack(anchor="w", pady=(5, 4))
+
+        self.scan_add_files_btn = ctk.CTkButton(
+            self.scan_scroll,
+            text="画像を追加",
+            fg_color="#2D2D39",
+            hover_color="#3F3F52",
+            command=self.select_scan_files
+        )
+        self.scan_add_files_btn.pack(fill="x", pady=(0, 6))
+
+        self.scan_add_folder_btn = ctk.CTkButton(
+            self.scan_scroll,
+            text="フォルダから追加",
+            fg_color="#2D2D39",
+            hover_color="#3F3F52",
+            command=self.select_scan_folder
+        )
+        self.scan_add_folder_btn.pack(fill="x", pady=(0, 6))
+
+        self.scan_clear_btn = ctk.CTkButton(
+            self.scan_scroll,
+            text="リストをクリア",
+            fg_color="transparent",
+            border_color=COLOR_BORDER,
+            border_width=2,
+            hover_color="#272730",
+            text_color=COLOR_TEXT,
+            command=self.clear_scan_files
+        )
+        self.scan_clear_btn.pack(fill="x", pady=(0, 10))
+
+        self.scan_count_label = ctk.CTkLabel(
+            self.scan_scroll,
+            text="0枚選択中",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            text_color=COLOR_TEXT_MUTED
+        )
+        self.scan_count_label.pack(anchor="w", pady=(0, 4))
+
+        self.scan_output_label = ctk.CTkLabel(
+            self.scan_scroll,
+            text="保存先フォルダ",
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            text_color=COLOR_TEXT
+        )
+        self.scan_output_label.pack(anchor="w", pady=(8, 4))
+
+        self.scan_output_frame = ctk.CTkFrame(self.scan_scroll, fg_color="transparent")
+        self.scan_output_frame.pack(fill="x", pady=(0, 10))
+
+        self.scan_output_entry = ctk.CTkEntry(
+            self.scan_output_frame,
+            textvariable=self.scan_output_dir_var,
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+            height=30
+        )
+        self.scan_output_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        self.scan_output_btn = ctk.CTkButton(
+            self.scan_output_frame,
+            text="参照",
+            width=54,
+            height=30,
+            fg_color="#2D2D39",
+            hover_color="#3F3F52",
+            command=self.select_scan_output_dir
+        )
+        self.scan_output_btn.pack(side="right")
+
+        self.scan_strength_frame = ctk.CTkFrame(self.scan_scroll, fg_color="transparent")
+        self.scan_strength_frame.pack(fill="x", pady=(0, 4))
+        self.scan_strength_title = ctk.CTkLabel(
+            self.scan_strength_frame,
+            text="網点・ノイズ除去強度",
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            text_color=COLOR_TEXT
+        )
+        self.scan_strength_title.grid(row=0, column=0, sticky="w")
+        self.scan_strength_value = ctk.CTkLabel(
+            self.scan_strength_frame,
+            text="55%",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            text_color=COLOR_ACCENT
+        )
+        self.scan_strength_value.grid(row=0, column=1, sticky="e")
+        self.scan_strength_frame.grid_columnconfigure(0, weight=1)
+
+        self.scan_strength_slider = ctk.CTkSlider(
+            self.scan_scroll,
+            from_=0,
+            to=100,
+            number_of_steps=100,
+            command=self.update_scan_strength_label
+        )
+        self.scan_strength_slider.set(55)
+        self.scan_strength_slider.pack(fill="x", pady=(0, 10))
+
+        self.scan_detail_frame = ctk.CTkFrame(self.scan_scroll, fg_color="transparent")
+        self.scan_detail_frame.pack(fill="x", pady=(0, 4))
+        self.scan_detail_title = ctk.CTkLabel(
+            self.scan_detail_frame,
+            text="質感を残す量",
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            text_color=COLOR_TEXT
+        )
+        self.scan_detail_title.grid(row=0, column=0, sticky="w")
+        self.scan_detail_value = ctk.CTkLabel(
+            self.scan_detail_frame,
+            text="30%",
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+            text_color=COLOR_ACCENT
+        )
+        self.scan_detail_value.grid(row=0, column=1, sticky="e")
+        self.scan_detail_frame.grid_columnconfigure(0, weight=1)
+
+        self.scan_detail_slider = ctk.CTkSlider(
+            self.scan_scroll,
+            from_=0,
+            to=100,
+            number_of_steps=100,
+            command=self.update_scan_detail_label
+        )
+        self.scan_detail_slider.set(30)
+        self.scan_detail_slider.pack(fill="x", pady=(0, 10))
+
+        self.scan_moire_cb = ctk.CTkCheckBox(
+            self.scan_scroll,
+            text="モアレ低減を有効にする",
+            variable=self.scan_moire_var,
+            fg_color=COLOR_ACCENT,
+            hover_color=COLOR_ACCENT_HOVER,
+            text_color=COLOR_TEXT
+        )
+        self.scan_moire_cb.pack(fill="x", pady=(0, 8))
+
+        self.scan_action_frame = ctk.CTkFrame(self.scan_side_panel, fg_color="transparent")
+        self.scan_action_frame.pack(fill="x", side="bottom", padx=20, pady=25)
+
+        self.scan_status_label = ctk.CTkLabel(
+            self.scan_action_frame,
+            text="画像を追加してください",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            text_color=COLOR_TEXT_MUTED,
+            wraplength=290
+        )
+        self.scan_status_label.pack(fill="x", pady=(0, 10))
+
+        self.scan_progressbar = ctk.CTkProgressBar(
+            self.scan_action_frame,
+            progress_color=COLOR_ACCENT,
+            height=8
+        )
+        self.scan_progressbar.pack(fill="x", pady=(0, 10))
+        self.scan_progressbar.set(0)
+        self.scan_progressbar.pack_forget()
+
+        self.scan_run_btn = ctk.CTkButton(
+            self.scan_action_frame,
+            text="一括除去を開始",
+            font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
+            fg_color=COLOR_ACCENT,
+            hover_color=COLOR_ACCENT_HOVER,
+            text_color="#FFFFFF",
+            height=45,
+            corner_radius=8,
+            command=self.start_scan_process_async,
+            state="disabled"
+        )
+        self.scan_run_btn.pack(fill="x")
+
+        self.scan_main_view = ctk.CTkFrame(
+            self.tab_scan,
+            fg_color=COLOR_BG_DARK,
+            corner_radius=0
+        )
+        self.scan_main_view.grid(row=0, column=1, sticky="nsew", padx=0, pady=0)
+
+        self.scan_list_frame = ctk.CTkFrame(
+            self.scan_main_view,
+            fg_color=COLOR_PANEL_DARK,
+            border_color=COLOR_BORDER,
+            border_width=2,
+            corner_radius=12
+        )
+        self.scan_list_frame.pack(fill="both", expand=True, padx=30, pady=30)
+
+        self.scan_list_title = ctk.CTkLabel(
+            self.scan_list_frame,
+            text="処理待ち画像",
+            font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"),
+            text_color=COLOR_TEXT
+        )
+        self.scan_list_title.pack(anchor="w", padx=20, pady=(18, 8))
+
+        self.scan_file_listbox = tk.Listbox(
+            self.scan_list_frame,
+            bg=COLOR_BG_DARK,
+            fg=COLOR_TEXT,
+            selectbackground=COLOR_ACCENT,
+            highlightthickness=0,
+            bd=0,
+            font=("Segoe UI", 11)
+        )
+        self.scan_file_listbox.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+
+    def update_scan_strength_label(self, val):
+        value = int(float(val))
+        self.scan_degrid_strength_var.set(value)
+        self.scan_strength_value.configure(text=f"{value}%")
+
+    def update_scan_detail_label(self, val):
+        value = int(float(val))
+        self.scan_detail_keep_var.set(value)
+        self.scan_detail_value.configure(text=f"{value}%")
+
+    def select_scan_files(self):
+        file_paths = filedialog.askopenfilenames(
+            filetypes=[
+                ("Image files", "*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.tif;*.tiff"),
+                ("All files", "*.*")
+            ]
+        )
+        self.add_scan_files(file_paths)
+
+    def select_scan_folder(self):
+        folder_path = filedialog.askdirectory()
+        if folder_path:
+            image_files = self.scan_processor.list_image_files([folder_path], max_files=100)
+            self.add_scan_files(image_files)
+            if not self.scan_output_dir_var.get():
+                self.scan_output_dir_var.set(os.path.join(folder_path, "scan_cleaned"))
+
+    def add_scan_files(self, file_paths):
+        if self.processing:
+            return
+
+        added = 0
+        for file_path in file_paths:
+            if len(self.scan_file_paths) >= 100:
+                break
+            normalized = os.path.normpath(file_path)
+            ext = os.path.splitext(normalized)[1].lower()
+            if ext not in [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"]:
+                continue
+            if normalized not in self.scan_file_paths:
+                self.scan_file_paths.append(normalized)
+                added += 1
+
+        if added and not self.scan_output_dir_var.get() and self.scan_file_paths:
+            base_dir = os.path.dirname(self.scan_file_paths[0])
+            self.scan_output_dir_var.set(os.path.join(base_dir, "scan_cleaned"))
+
+        self.refresh_scan_file_list()
+
+    def clear_scan_files(self):
+        if self.processing:
+            return
+        self.scan_file_paths = []
+        self.refresh_scan_file_list()
+
+    def refresh_scan_file_list(self):
+        self.scan_file_listbox.delete(0, tk.END)
+        for file_path in self.scan_file_paths:
+            self.scan_file_listbox.insert(tk.END, file_path)
+
+        count = len(self.scan_file_paths)
+        self.scan_count_label.configure(text=f"{count}枚選択中")
+        if count:
+            self.scan_status_label.configure(text="設定を確認して一括除去を開始できます", text_color=COLOR_TEXT_MUTED)
+            if not self.processing:
+                self.scan_run_btn.configure(state="normal")
+        else:
+            self.scan_status_label.configure(text="画像を追加してください", text_color=COLOR_TEXT_MUTED)
+            self.scan_run_btn.configure(state="disabled")
+
+    def select_scan_output_dir(self):
+        selected_dir = filedialog.askdirectory(
+            initialdir=self.scan_output_dir_var.get() or os.path.expanduser("~")
+        )
+        if selected_dir:
+            self.scan_output_dir_var.set(selected_dir)
+
+    def set_scan_controls_state(self, state):
+        for widget in (
+            self.scan_add_files_btn,
+            self.scan_add_folder_btn,
+            self.scan_clear_btn,
+            self.scan_output_entry,
+            self.scan_output_btn,
+            self.scan_strength_slider,
+            self.scan_detail_slider,
+            self.scan_moire_cb,
+            self.scan_run_btn,
+        ):
+            widget.configure(state=state)
+
+    def start_scan_process_async(self):
+        if self.processing or not self.scan_file_paths:
+            return
+
+        output_dir = self.scan_output_dir_var.get().strip()
+        if not output_dir:
+            messagebox.showerror("エラー", "保存先フォルダを指定してください。")
+            return
+
+        self.processing = True
+        self.set_scan_controls_state("disabled")
+        self.scan_progressbar.pack(fill="x", pady=(0, 10), after=self.scan_status_label)
+        self.scan_progressbar.configure(mode="determinate")
+        self.scan_progressbar.set(0)
+        self.scan_status_label.configure(text="スキャン画像の一括除去を開始します...", text_color=COLOR_TEXT_MUTED)
+
+        options = ScanProcessOptions(
+            degrid_strength=int(self.scan_degrid_strength_var.get()),
+            detail_keep=int(self.scan_detail_keep_var.get()),
+            moire_reduction=self.scan_moire_var.get(),
+            max_files=100,
+        )
+        target_files = list(self.scan_file_paths)
+
+        def task():
+            try:
+                def progress_cb(msg, progress):
+                    self.gui_queue.put({
+                        "type": "scan_status",
+                        "text": msg,
+                        "progress": progress,
+                    })
+
+                outputs = self.scan_processor.process_batch(
+                    target_files,
+                    output_dir,
+                    options=options,
+                    progress_callback=progress_cb,
+                )
+                self.gui_queue.put({"type": "scan_complete", "outputs": outputs})
+            except Exception as e:
+                self.gui_queue.put({"type": "scan_error", "error": str(e)})
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def on_scan_process_complete(self, outputs):
+        self.processing = False
+        self.scan_progressbar.pack_forget()
+        self.set_scan_controls_state("normal")
+        self.scan_run_btn.configure(state="normal" if self.scan_file_paths else "disabled")
+        self.scan_status_label.configure(
+            text=f"完了: {len(outputs)}枚を保存しました",
+            text_color=COLOR_ACCENT
+        )
+        messagebox.showinfo("完了", f"{len(outputs)}枚のスキャン画像処理が完了しました。")
+
+    def on_scan_process_error(self, err_msg):
+        self.processing = False
+        self.scan_progressbar.pack_forget()
+        self.set_scan_controls_state("normal")
+        self.scan_run_btn.configure(state="normal" if self.scan_file_paths else "disabled")
+        self.scan_status_label.configure(text="処理エラーが発生しました。", text_color="#EF4444")
+        messagebox.showerror("処理エラー", f"スキャン画像処理中にエラーが発生しました:\n{err_msg}")
+
     def select_file(self):
         """画像ファイル選択ダイアログを開く"""
         file_path = filedialog.askopenfilename(
@@ -2434,6 +2847,20 @@ class UpscalerApp(ctk.CTk, TkinterDnD.DnDWrapper if TKDND_AVAILABLE else object)
                 elif msg_type == "aimask_error":
                     err_msg = msg_data.get("error")
                     self.on_aimask_process_error(err_msg)
+
+                elif msg_type == "scan_status":
+                    text = msg_data.get("text", "")
+                    progress = msg_data.get("progress", 0.0)
+                    self.scan_status_label.configure(text=text, text_color=COLOR_TEXT_MUTED)
+                    self.scan_progressbar.set(progress)
+
+                elif msg_type == "scan_complete":
+                    outputs = msg_data.get("outputs", [])
+                    self.on_scan_process_complete(outputs)
+
+                elif msg_type == "scan_error":
+                    err_msg = msg_data.get("error")
+                    self.on_scan_process_error(err_msg)
                     
                 self.gui_queue.task_done()
         except queue.Empty:
